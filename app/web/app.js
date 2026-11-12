@@ -418,8 +418,8 @@ async function reimbursementPage() {
       try {
         const [{items}, tags] = await Promise.all([api(`/api/reimbursements/fixed-options?title_id=${encodeURIComponent(selectedTitle)}`), api('/api/invoices/tags')]);
         if (!form.isConnected || title.value !== selectedTitle) return;
-        const rows = items.map(row => `<tr data-fixed-row><td><input type="checkbox" name="fixed" value="${row.id}" ${fixed.has(row.id) ? 'checked' : ''} aria-label="选择发票 ${escapeHTML(row.invoice_number)}"></td><td>${escapeHTML(row.invoice_number)}</td><td>${escapeHTML(row.seller_name)}</td><td>${escapeHTML(row.invoice_date)}</td><td class="amount">¥ ${money(row.amount)}</td><td>${escapeHTML(row.remarks || '—')}</td><td>${escapeHTML(row.tags.join('、') || '未分类')}</td></tr>`).join('');
-        const content = rows ? `<div class="table-wrap"><table><thead><tr><th>选择</th><th>发票号码</th><th>销售方名称</th><th>开票日期</th><th>价税合计</th><th>备注</th><th>标签</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p>该抬头下暂无可用发票。</p>';
+        const rows = items.map(row => `<tr data-fixed-row><td><input type="checkbox" name="fixed" value="${row.id}" ${fixed.has(row.id) ? 'checked' : ''} aria-label="选择发票 ${escapeHTML(row.invoice_number)}"></td><td>${escapeHTML(row.invoice_number)}</td><td>${escapeHTML(row.seller_name)}</td><td>${escapeHTML(row.invoice_date)}</td><td class="amount">¥ ${money(row.amount)}</td><td>${escapeHTML(row.tags.join('、') || '未分类')}</td><td>${escapeHTML(row.remarks || '—')}</td></tr>`).join('');
+        const content = rows ? `<div class="table-wrap"><table><thead><tr><th>选择</th><th>发票号码</th><th>销售方名称</th><th>开票日期</th><th>价税合计</th><th>标签</th><th>备注</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p>该抬头下暂无可用发票。</p>';
         const filters = `<div class="fixed-filters">${tagField(tags.items)}${invoiceSearchFields()}<button type="button" data-clear>重置</button></div>`;
         openForm('选择固定发票', filters + content + '<p data-no-match hidden>没有符合筛选条件的发票。</p>', '确定', async values => {
           const ids = values.getAll('fixed').map(Number);
