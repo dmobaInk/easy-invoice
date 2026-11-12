@@ -2,6 +2,9 @@ from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from decimal import Decimal
+from io import BytesIO
+from xml.etree import ElementTree
+from zipfile import ZipFile
 import itertools
 import json
 import logging
@@ -323,6 +326,45 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(result['target_met'])
         self.assertIn('81.00', result['message'])
 
+    def test_fixed_invoices_filter_and_constrained_match(self):
+        title = self.title()
+        fixed = self.invoice(title_id=title, amount=45)
+        extra = self.invoice(title_id=title, amount=60)
+        self.invoice(title_id=title, amount=100)
+        excluded = self.invoice(title_id=title, status='excluded')
+        other = self.invoice(title_id=self.title(name='Other'))
+        with self.db() as db, db:
+            db.execute('INSERT INTO invoice_remarks VALUES (?, ?)', (fixed, '出差'))
+        self.login()
+        options = self.client.get('/api/reimbursements/fixed-options', params={'title_id': title}).json()['items']
+        self.assertEqual(len(options), 3)
+        self.assertEqual(next(r for r in options if r['id'] == fixed)['remarks'], '出差')
+        payload = dict(title_id=title, target_amount=100, fixed_invoice_ids=[fixed])
+        url = '/api/reimbursements/optimize'
+        result = self.mutate('POST', url, json=payload).json()
+        self.assertEqual([r['id'] for r in result['invoices']], [fixed, extra])
+        result = self.mutate('POST', url + '?stream=true', json={**payload, 'allow_exceed': False})
+        self.assertEqual(json.loads(result.text.splitlines()[-1])['result']['total_amount'], 45)
+        self.assertEqual(self.mutate('POST', url, json={**payload, 'target_amount': 40,
+                         'allow_exceed': False}).status_code, 422)
+        for invalid in [excluded, other]:
+            self.assertEqual(self.mutate('POST', url, json={**payload, 'fixed_invoice_ids': [invalid]}).status_code, 409)
+
+    def test_streamed_match_reports_progress_and_saves_exact_plan(self):
+        title = self.title()
+        ids = [self.invoice(title_id=title, amount=v) for v in (70, 60, 40)]
+        self.login()
+        response = self.mutate('POST', '/api/reimbursements/optimize?stream=true',
+                               json={'title_id': title, 'target_amount': 100})
+        self.assertEqual(response.status_code, 200)
+        events = [json.loads(line) for line in response.iter_lines()]
+        self.assertEqual([event['done'] for event in events[:-1]], [0, 1, 2, 3])
+        self.assertEqual(events[-2]['best_cents'], 10000)
+        self.assertEqual(events[-2]['eta'], 0)
+        result = events[-1]['result']
+        self.assertEqual([row['id'] for row in result['invoices']], ids[1:])
+        self.assertEqual(self.client.get('/api/reimbursements').json()['items'][0]['id'], result['id'])
+
     def test_optimize_and_pdf_default_auto_reimbursement(self):
         title = self.title()
         ids = [self.invoice(title_id=title,amount=amount) for amount in (70,60,40)]
@@ -343,6 +385,87 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(self.client.get(f'/api/invoices/{key}').json()['status'],'reimbursed')
         self.assertEqual(self.client.get(f'/api/invoices/{ids[0]}').json()['status'],'active')
         self.assertEqual(self.client.get('/api/print').json()['total'],1)
+
+    def test_tags_search_suggestions_and_isolation(self):
+        title = self.title()
+        invoice = self.invoice(title_id=title)
+        other = self.invoice(user_id=2, title_id=self.title(user_id=2))
+        self.login()
+        path = f'/api/invoices/{invoice}/tag'
+        self.assertEqual(self.client.get('/api/invoices', params={'tag':'分类'}).json()['total'], 1)
+        self.assertEqual(self.mutate('PUT', path, json={'names':['  上海差旅  ', '住宿', '住宿']}).json()['tags'], ['上海差旅', '住宿'])
+        self.assertEqual(self.client.get('/api/invoices', params={'tag':'海差'}).json()['items'][0]['id'], invoice)
+        options = self.client.get('/api/reimbursements/fixed-options', params={'title_id':title})
+        self.assertEqual(set(options.json()['items'][0]['tags']), {'上海差旅','住宿'})
+        self.assertEqual(self.client.get('/api/invoices', params={'tag':'住'}).json()['total'], 1)
+        self.assertEqual(self.client.get('/api/invoices', params={'tag':'未分类'}).json()['total'], 0)
+        self.assertEqual(self.mutate('PUT', f'/api/invoices/{other}/tag', json={'names':['越权']}).status_code, 404)
+        self.mutate('PUT', path, json={'names':[]})
+        self.assertEqual(set(self.client.get('/api/invoices/tags').json()['items']), {'未分类','上海差旅','住宿'})
+        self.assertEqual(self.client.get('/api/invoices', params={'tag':'差旅'}).json()['total'], 0)
+
+    def test_direct_export_originals_and_reimbursement_dates(self):
+        title = self.title()
+        ids = [self.invoice(title_id=title) for _ in range(2)]
+        self.login()
+        originals = [self.client.get(f'/api/invoices/{i}/file').content for i in ids]
+        payload = {'title_id': title, 'invoice_ids': ids, 'merge_pdf': False}
+        response = self.mutate('POST', '/api/print/generate', json=payload)
+        self.assertEqual(response.status_code, 201, response.text)
+        job = response.json()
+        bundle = self.client.get(job['bundle_url']).content
+        self.assertEqual(bundle, self.client.get(job['download_url']).content)
+        with ZipFile(BytesIO(bundle)) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), 3)
+            self.assertEqual([archive.read(n) for n in names if n.endswith('.pdf')], originals)
+            self.assertEqual(archive.read('报销清单.xlsx'), self.client.get(job['manifest_url']).content)
+        def listed():
+            return self.client.get('/api/invoices?seller_name=ell').json()['items']
+        rows = listed()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row['reimbursed_at'] for row in rows))
+        self.assertEqual(self.client.get('/api/invoices?seller_name=missing').json()['total'], 0)
+        self.mutate('PUT', f'/api/invoices/{rows[0]["id"]}', json={'status': 'active'})
+        self.assertIsNone(next(r for r in listed() if r['id'] == rows[0]['id'])['reimbursed_at'])
+        self.mutate('PUT', f'/api/invoices/{rows[0]["id"]}', json={'status': 'reimbursed'})
+        self.assertTrue(all(row['reimbursed_at'] for row in listed()))
+
+    def test_manifest_order_values_and_saved_download(self):
+        title = self.title()
+        first = self.invoice(title_id=title, amount=12.34)
+        second = self.invoice(title_id=title, amount=20)
+        with self.db() as db, db:
+            db.execute('INSERT INTO invoice_item_names VALUES (?, ?)', (first, '纸张,墨盒'))
+        self.login()
+        plan = self.plan(title)
+        result = self.mutate('POST', '/api/print/generate', json={
+            'reimbursement_plan_id': plan['id'], 'invoice_ids': [second, first],
+            'auto_reimburse': False,
+        }).json()
+        content = self.client.get(result['manifest_url']).content
+        bundle = self.client.get(result['bundle_url'])
+        self.assertEqual(bundle.headers['content-type'], 'application/zip')
+        with ZipFile(BytesIO(bundle.content)) as archive:
+            self.assertEqual(len(archive.namelist()), 2)
+            self.assertEqual(archive.read(f"invoices-a4-{result['id']}.pdf"),
+                             self.client.get(result['download_url']).content)
+            self.assertEqual(archive.read(f"报销清单-{result['id']}.xlsx"), content)
+        with ZipFile(BytesIO(content)) as archive:
+            sheet = ElementTree.fromstring(archive.read('xl/worksheets/sheet1.xml'))
+            rows = []
+            for row in sheet.findall('.//{*}row'):
+                values = []
+                for cell in row:
+                    value = cell.findtext('{*}v')
+                    values.append(cell.findtext('{*}is/{*}t') if cell.get('t') == 'inlineStr' else float(value))
+                rows.append(values)
+        self.assertEqual(rows, [['名称/型号', '数量', '公司', '单价', '总价（元）'],
+                                ['', 1, 'Seller', 20, 20], ['纸张,墨盒', 1, 'Seller', 12.34, 12.34]])
+        with self.db() as db, db:
+            db.execute('UPDATE invoices SET amount = 99 WHERE id = ?', (first,))
+        saved = self.client.get('/api/print').json()['items'][0]['manifest_url']
+        self.assertEqual(self.client.get(saved).content, content)
 
     def test_pdf_no_auto_and_checkbox_subset(self):
         title = self.title()
@@ -424,6 +547,13 @@ class OptimizationTests(unittest.TestCase):
                             valid.append(((total<target,abs(total-target),len(ids),ids),list(ids)))
                 expected=min(valid)[1] if valid else []
                 self.assertEqual(optimize(rows,Decimal(target)/100,exceed),expected)
+
+    def test_large_single_does_not_expand_search_for_twenty_thousand(self):
+        rows = [{'id': 1, 'amount': 10000000}]
+        rows.extend({'id': i, 'amount': Decimal(20000 + i) / 100} for i in range(2, 101))
+        self.assertEqual(optimize(rows, 20000), [1])
+        rows[-1]['amount'] = 400
+        self.assertEqual(optimize(rows, 20000), list(range(2, 101)))
 
     def test_greedy_counterexample_exceed_tie_and_limit(self):
         rows=[{'id':1,'amount':70},{'id':2,'amount':60},{'id':3,'amount':40}]

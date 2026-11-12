@@ -1,3 +1,4 @@
+import json
 from datetime import date
 from dataclasses import asdict
 from decimal import Decimal
@@ -11,7 +12,7 @@ from fastapi.responses import FileResponse
 
 from app.api.dependencies import current_user, database, managed_file, owned, require_csrf
 from app.integrations.feishu.files import MAX_PDF_BYTES
-from app.schemas.requests import InvoiceStatus, InvoiceUpdate
+from app.schemas.requests import InvoiceStatus, InvoiceTag, InvoiceUpdate
 from app.services.storage import InvalidPdfError, LocalStorage
 from app.db.repositories.invoices import InvoiceRepository
 from app.integrations.aliyun.invoice_ocr import AliyunInvoiceOcr
@@ -32,8 +33,32 @@ def summary(user=Depends(current_user), db=Depends(database)):
     return {row['status']: {'count': row['count'], 'amount': row['amount']} for row in rows}
 
 
+@router.get('/tags')
+def tag_choices(user=Depends(current_user), db=Depends(database)):
+    rows = db.execute("SELECT t.name, coalesce(usage.n, 0) AS frequency FROM user_invoice_tags t "
+                      "LEFT JOIN (SELECT a.name, count(*) n FROM invoice_tag_assignments a "
+                      "JOIN invoices i ON i.id = a.invoice_id WHERE i.user_id = ? GROUP BY a.name) usage "
+                      "ON usage.name = t.name WHERE t.user_id = ? ORDER BY frequency DESC, t.name",
+                      (user['id'], user['id']))
+    return {'items': ['未分类', *(row['name'] for row in rows)]}
+
+
+@router.put('/{invoice_id}/tag', dependencies=[Depends(require_csrf)])
+def set_tag(invoice_id: int, data: InvoiceTag, user=Depends(current_user), db=Depends(database)):
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        owned(db, 'invoices', invoice_id, user['id'])
+        db.execute('DELETE FROM invoice_tag_assignments WHERE invoice_id = ?', (invoice_id,))
+        db.executemany('INSERT OR IGNORE INTO user_invoice_tags VALUES (?, ?)',
+                       [(user['id'], name) for name in data.names])
+        db.executemany('INSERT INTO invoice_tag_assignments VALUES (?, ?)',
+                       [(invoice_id, name) for name in data.names])
+    return {'tags': data.names}
+
+
 @router.get('')
 def list_invoices(title_id: Optional[int] = Query(default=None, gt=0), status: Optional[InvoiceStatus] = None,
+                  seller_name: Optional[str] = None, tag: Optional[str] = None,
                   amount_min: Optional[Decimal] = Query(default=None, ge=0),
                   amount_max: Optional[Decimal] = Query(default=None, ge=0),
                   date_from: Optional[date] = None, date_to: Optional[date] = None,
@@ -52,13 +77,25 @@ def list_invoices(title_id: Optional[int] = Query(default=None, gt=0), status: O
         if value is not None:
             clauses.append(f'i.{field} {operator} ?')
             params.append(value)
+    if seller_name and seller_name.strip():
+        clauses.append("instr(lower(i.seller_name), lower(?)) > 0")
+        params.append(seller_name.strip())
+    source = ' FROM invoices i '
+    if tag and tag.strip():
+        condition = ("EXISTS (SELECT 1 FROM invoice_tag_assignments a WHERE a.invoice_id = i.id "
+                     "AND instr(lower(a.name), lower(?)) > 0)")
+        if tag.strip() in '未分类':
+            condition = '(' + condition + ' OR NOT EXISTS (SELECT 1 FROM invoice_tag_assignments a WHERE a.invoice_id = i.id))'
+        clauses.append(condition)
+        params.append(tag.strip())
     where = ' AND '.join(clauses)
-    total = db.execute('SELECT count(*) FROM invoices i WHERE ' + where, params).fetchone()[0]
-    rows = db.execute('SELECT i.*, t.title_name FROM invoices i LEFT JOIN invoice_titles t '
+    total = db.execute('SELECT count(*)' + source + 'WHERE ' + where, params).fetchone()[0]
+    rows = db.execute("SELECT i.*, t.title_name, d.reimbursed_at, (SELECT json_group_array(name) FROM invoice_tag_assignments WHERE invoice_id = i.id) tags" + source +
+                      'LEFT JOIN reimbursement_dates d ON d.invoice_id = i.id LEFT JOIN invoice_titles t '
                       'ON t.id = i.title_id AND t.user_id = i.user_id WHERE ' + where +
                       ' ORDER BY i.created_at DESC, i.id DESC LIMIT ? OFFSET ?',
                       params + [page_size, (page - 1) * page_size]).fetchall()
-    return {'items': [public_invoice(row) for row in rows], 'total': total, 'page': page, 'page_size': page_size}
+    return {'items': [{**public_invoice(row), 'tags': json.loads(row['tags'])} for row in rows], 'total': total, 'page': page, 'page_size': page_size}
 
 
 @router.post('/upload', dependencies=[Depends(require_csrf)], status_code=201)

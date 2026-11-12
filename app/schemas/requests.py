@@ -47,6 +47,18 @@ class TitleInput(Input):
 InvoiceStatus = Literal['pending', 'active', 'reimbursed', 'excluded']
 
 
+class InvoiceTag(Input):
+    names: list[str]
+
+    @field_validator('names')
+    @classmethod
+    def clean_names(cls, values):
+        names = list(dict.fromkeys(value.strip() for value in values))
+        if any(len(name) > 64 for name in names):
+            raise ValueError('每个标签最多 64 个字符')
+        return [name for name in names if name and name != '未分类']
+
+
 class InvoiceUpdate(Input):
     title_id: Optional[int] = Field(default=None, gt=0)
     invoice_code: Optional[str] = Field(default=None, max_length=32, pattern=r'^[0-9]+$')
@@ -63,10 +75,13 @@ class Optimize(Input):
     title_id: int = Field(gt=0)
     target_amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
     allow_exceed: bool = True
+    fixed_invoice_ids: list[int] = Field(default_factory=list, max_length=200)
 
 
 class PrintGenerate(Input):
-    reimbursement_plan_id: int = Field(gt=0)
+    reimbursement_plan_id: Optional[int] = Field(default=None, gt=0)
+    title_id: Optional[int] = Field(default=None, gt=0)
+    merge_pdf: bool = True
     invoice_ids: list[int] = Field(min_length=1, max_length=200)
     auto_reimburse: bool = True
 

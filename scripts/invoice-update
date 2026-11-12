@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Install and reverse application-only git patches on the systemd deployment."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.request import urlopen
+
+SERVICE = 'easy-invoice'
+STORE = Path('/var/lib/easy-invoice-updater')
+INBOX = Path('/opt/easy-invoice-updates/update.patch')
+HEALTH = 'http://127.0.0.1:8000/health'
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def property_value(name):
+    return run('systemctl', 'show', SERVICE, '-p', name, '--value',
+               stdout=subprocess.PIPE, text=True).stdout.strip()
+
+
+def healthy():
+    for _ in range(30):
+        try:
+            with urlopen(HEALTH, timeout=2) as response:
+                if response.status == 200:
+                    return
+        except OSError:
+            pass
+        time.sleep(1)
+    raise RuntimeError('服务健康检查失败，请查看 journalctl -u easy-invoice')
+
+
+def save_state(state):
+    tmp = STORE / 'state.tmp'
+    tmp.write_text(json.dumps(state))
+    tmp.replace(STORE / 'state.json')
+
+
+def patch_paths(patch):
+    # Only ordinary text edits, additions and deletions under app/.
+    raw = run('git', 'apply', '--numstat', '-z', patch, stdout=subprocess.PIPE).stdout
+    paths = []
+    for record in raw.rstrip(b'\0').split(b'\0'):
+        added, removed, path = record.decode().split('\t', 2)
+        if not (added.isdigit() and removed.isdigit() and
+                re.fullmatch(r'app/(?:[\w-]+/)*[\w.-]+\.(?:py|js|css|html)', path)):
+            raise ValueError(f'补丁含有不支持的文件：{path}')
+        p = Path(path)
+        if p.resolve() != Path.cwd() / p or (p.exists() and not p.is_file()):
+            raise ValueError(f'路径不是普通应用文件：{path}')
+        paths.append(path)
+    return paths
+
+
+def recover(state):
+    txn = STORE / state['pending']
+    paths = json.loads((txn / 'paths.json').read_text())
+    run('systemctl', 'stop', SERVICE)
+    for name in paths:
+        old = txn / 'before' / name
+        dest = Path(name)
+        if old.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(old, dest)
+            os.chown(dest, old.stat().st_uid, old.stat().st_gid)
+        elif dest.exists():
+            dest.unlink()
+    run('systemctl', 'start', SERVICE)
+    healthy()
+    state.pop('pending')
+    save_state(state)
+    print('已恢复到本次操作前的代码并通过健康检查。')
+
+
+def operate(action):
+    os.chdir(property_value('WorkingDirectory'))
+    state_file = STORE / 'state.json'
+    state = json.loads(state_file.read_text()) if state_file.exists() else {'history': []}
+    if state.get('pending'):
+        recover(state)
+        print('上次操作曾中断。如仍需更新或回滚，请再次执行命令。')
+        return
+    reverse = action == 'rollback'
+    if reverse and not state['history']:
+        print('没有可回滚的版本。')
+        return
+    source = STORE / state['history'][-1] / 'update.patch' if reverse else INBOX
+    txn = Path(tempfile.mkdtemp(prefix=time.strftime('%Y%m%d-%H%M%S-'), dir=STORE))
+    patch = txn / 'update.patch'
+    shutil.copyfile(source, patch)
+    if not reverse and state['history'] and patch.read_bytes() == (
+            STORE / state['history'][-1] / 'update.patch').read_bytes():
+        print('当前版本已应用此补丁。')
+        return
+    paths = patch_paths(patch)
+    command = ['git', 'apply'] + (['-R'] if reverse else [])
+    run(*command, '--check', patch)
+    run('systemctl', 'is-active', '--quiet', SERVICE)
+    # Use the live process environment, including systemd overrides of DATABASE_PATH.
+    pid = int(property_value('MainPID'))
+    env = dict(item.split(b'=', 1) for item in Path(f'/proc/{pid}/environ').read_bytes().split(b'\0') if item)
+    python = str(Path.cwd() / '.venv/bin/python')
+    db = Path(run(python, '-c', 'from app.config import Settings; print(Settings.from_env().database_path)',
+                  env=env, stdout=subprocess.PIPE, text=True).stdout.strip()).resolve(strict=True)
+    if not db.is_file() or any(db.parent in Path(p).resolve().parents for p in paths):
+        raise ValueError('补丁路径与运行数据目录冲突或数据库路径无效')
+    for name in paths:
+        if Path(name).exists():
+            old = txn / 'before' / name
+            old.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(name, old)
+            st = Path(name).stat()
+            os.chown(old, st.st_uid, st.st_gid)
+    (txn / 'paths.json').write_text(json.dumps(paths))
+    state['pending'] = txn.name
+    save_state(state)
+    try:
+        run('systemctl', 'stop', SERVICE)
+        run(python, '-m', 'scripts.backup', '--database', db, '--output', txn / 'data-backup',
+            '--service-stopped')
+        # New files must be readable by the service account.
+        previous = os.umask(0o022)
+        try:
+            run(*command, patch)
+        finally:
+            os.umask(previous)
+        run('systemctl', 'start', SERVICE)
+        healthy()
+        history = state['history'][:-1] if reverse else state['history'] + [txn.name]
+        save_state({'history': history})
+    except (Exception, KeyboardInterrupt):
+        recover(state)
+        raise
+    print('回滚成功。' if reverse else '更新成功。', '备份位置：', txn / 'data-backup')
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ('update', 'rollback'):
+        raise ValueError('用法：sudo invoice-update update 或 sudo invoice-update rollback')
+    if os.geteuid() != 0:
+        raise ValueError('请使用 sudo 执行')
+    os.umask(0o077)
+    STORE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STORE / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        operate(sys.argv[1])
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Exception, KeyboardInterrupt) as exc:
+        sys.exit(f'操作未完成：{exc}')

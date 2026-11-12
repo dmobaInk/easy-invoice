@@ -31,6 +31,8 @@ class RecognizedInvoice:
     amount: Optional[Decimal] = None
     buyer_tax_number: Optional[str] = None
     validation_error: Optional[str] = None
+    item_names: tuple = ()
+    remarks: Optional[str] = None
 
 
 def text(value):
@@ -84,7 +86,11 @@ def parse_invoice_data(raw: str) -> RecognizedInvoice:
     code = digits(data.get('invoiceCode'))
     number = digits(data.get('invoiceNumber'))
     kind = text(data.get('invoiceType')) or text(data.get('title'))
+    details = data.get('invoiceDetails')
+    names = tuple(name for detail in details if isinstance(detail, dict)
+                  if (name := text(detail.get('itemName')))) if isinstance(details, list) else ()
     values = {
+        'item_names': names, 'remarks': text(data.get('remarks')),
         'invoice_code': code, 'invoice_number': number,
         'invoice_date': normalize_date(data.get('invoiceDate')),
         'buyer_name': text(data.get('purchaserName')), 'seller_name': text(data.get('sellerName')),

@@ -36,6 +36,7 @@ async function api(path, options={}) {
   const headers = {'X-CSRF-Token':state.csrf, ...options.headers};
   if (options.body && !(options.body instanceof FormData)) headers['Content-Type'] = 'application/json';
   const response = await fetch(path, {...options, headers, credentials:'same-origin'});
+  if (response.ok && response.headers.get('Content-Type')?.includes('application/x-ndjson')) return response;
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     if (response.status === 401 && state.user) {
@@ -194,13 +195,70 @@ function pagination(total, page, size) {
   return `<div class="table-footer"><span>共 ${total} 条记录 · 第 ${page} / ${Math.max(1, Math.ceil(total/size))} 页</span><div class="actions"><button class="small" id="prev" ${page <= 1 ? 'disabled' : ''}>上一页</button><button class="small" id="next" ${page*size >= total ? 'disabled' : ''}>下一页</button></div></div>`;
 }
 
+function tagField(tags, value = '', listId = 'invoice-tag-choices') {
+  const options = tags.map(tag => `<option value="${escapeHTML(tag)}">${escapeHTML(tag)}</option>`).join('');
+  return `<div class="tag-field"><label>标签<input name="tag" list="${listId}" maxlength="64" autocomplete="off" placeholder="选择或输入" value="${escapeHTML(value)}"></label><datalist id="${listId}">${options}</datalist><span class="tag-picker">▾<select aria-label="选择常用标签" data-tag-choice><option value="">常用标签</option>${options}</select></span></div>`;
+}
+
+document.addEventListener('change', event => {
+  const choice = event.target;
+  if (!choice.matches('[data-tag-choice]') || !choice.value) return;
+  const input = choice.closest('.tag-field').querySelector('input');
+  input.value = choice.value;
+  choice.selectedIndex = 0;
+  input.dispatchEvent(new Event('input', {bubbles:true}));
+});
+
+function invoiceSearchFields(filters = {}) {
+  const fields = [['seller_name','销售方名称','text'],['amount_min','最低金额','number'],
+                  ['amount_max','最高金额','number'],['date_from','起始日期','date'],['date_to','截止日期','date']];
+  return fields.map(([name,label,type]) => `<label>${label}<input name="${name}" type="${type}" ${type === 'number' ? 'min="0" step="0.01"' : ''} value="${escapeHTML(filters[name] || '')}"></label>`).join('');
+}
+
 async function invoicePage() {
   const parameters = new URLSearchParams({...state.filters, page:state.invoicePage});
-  const [data, summary, titles] = await Promise.all([api(`/api/invoices?${parameters}`), api('/api/invoices/summary'), api('/api/titles')]);
+  const [data, summary, titles, tags] = await Promise.all([api(`/api/invoices?${parameters}`), api('/api/invoices/summary'), api('/api/titles'), api('/api/invoices/tags')]);
   const options = titles.items.map(item => `<option value="${item.id}" ${String(state.filters.title_id) === String(item.id) ? 'selected' : ''}>${escapeHTML(item.title_name)}</option>`).join('');
   const metrics = `<div class="metrics"><div class="metric primary"><div class="metric-label">可用发票金额 ${icon('invoice')}</div><strong><small>¥</small>${money(summary.active?.amount)}</strong><span class="caption">${summary.active?.count || 0} 张发票，等待下一次报销</span></div><div class="metric"><div class="metric-label">待确认 ${icon('titles')}</div><strong>${summary.pending?.count || 0}<small> 张</small></strong><span class="caption">补全信息后即可参与报销</span></div><div class="metric"><div class="metric-label">已报销金额 ${icon('check')}</div><strong><small>¥</small>${money(summary.reimbursed?.amount)}</strong><span class="caption">${summary.reimbursed?.count || 0} 张发票，已完成报销</span></div><div class="metric"><div class="metric-label">收录发票 ${icon('invoice')}</div><strong>${Object.values(summary).reduce((n,item) => n+item.count,0)}<small> 张</small></strong><span class="caption">所有状态的发票记录</span></div></div>`;
-  const rows = data.items.map(row => `<tr><td class="strong">${escapeHTML(row.invoice_number || '等待补录')}<span class="subline">${escapeHTML(row.invoice_type || '待识别发票')}</span></td><td>${escapeHTML(row.invoice_date || '—')}</td><td class="title-cell" title="${escapeHTML(row.title_name || row.buyer_name || '')}">${escapeHTML(row.title_name || row.buyer_name || '未归类')}</td><td class="amount">${row.amount == null ? '—' : '¥ '+money(row.amount)}</td><td>${badge(row.status)}</td><td><div class="row-actions"><button class="subtle small" data-edit="${row.id}">编辑</button><button class="subtle small" data-preview="${row.id}">预览</button><a class="button small" href="/api/invoices/${row.id}/file" download>原件下载</a><button class="subtle small danger" data-delete-invoice="${row.id}">删除</button></div></td></tr>`).join('');
-  return {html:heading('我的发票','从飞书收集，在这里整理。每一张发票，都有清晰的去处。','<button id="upload-button" class="primary">＋ 上传 PDF</button><input type="file" id="upload-input" accept="application/pdf,.pdf" hidden>')+metrics+`<section class="panel"><div class="panel-head"><h2>发票清单</h2><span class="muted">仅展示当前账号的发票</span></div><form class="filters" id="filters"><label>发票抬头<select name="title_id"><option value="">全部抬头</option>${options}</select></label><label>状态<select name="status"><option value="">全部状态</option>${Object.entries(labels).map(([key,value]) => `<option value="${key}" ${state.filters.status === key ? 'selected' : ''}>${value}</option>`).join('')}</select></label>${[['amount_min','最低金额','number'],['amount_max','最高金额','number'],['date_from','起始日期','date'],['date_to','截止日期','date']].map(([name,label,type]) => `<label>${label}<input name="${name}" type="${type}" ${type === 'number' ? 'min="0" step="0.01"' : ''} value="${escapeHTML(state.filters[name] || '')}"></label>`).join('')}<button class="primary" type="submit">筛选</button><button id="reset-filters" type="button">重置</button></form>${rows ? `<div class="table-wrap"><table><thead><tr><th>发票号码 / 类型</th><th>开票日期</th><th>发票抬头</th><th>价税合计</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty('这里还没有发票','在飞书向机器人发送 PDF，或上传 PDF 自动识别并归类。')}${pagination(data.total,state.invoicePage,data.page_size)}</section><div class="helper">${icon('assist')}<span><strong>让飞书帮你收集。</strong> 先在「账户设置」查看绑定方式，再向机器人发送 PDF，识别结果会出现在这里。</span></div>`, bind:() => {
+  const rows = data.items.map(row => `<tr><td class="strong">${escapeHTML(row.invoice_number || '等待补录')}<span class="subline">${escapeHTML(row.invoice_type || '待识别发票')}</span></td><td>${escapeHTML(row.invoice_date || '—')}</td><td class="title-cell" title="${escapeHTML(row.title_name || row.buyer_name || '')}">${escapeHTML(row.title_name || row.buyer_name || '未归类')}</td><td>${escapeHTML(row.seller_name || '--')}</td><td class="amount">${row.amount == null ? '—' : '¥ '+money(row.amount)}</td><td>${row.reimbursed_at ? new Date(row.reimbursed_at).toLocaleDateString('zh-CN') : row.status === 'reimbursed' ? '日期未记录' : '--'}</td><td><button class="small" type="button" data-tag="${row.id}">${escapeHTML(row.tags.join('、') || '未分类')}</button></td><td>${badge(row.status)}</td><td><div class="row-actions"><button class="subtle small" data-edit="${row.id}">编辑</button><button class="subtle small" data-preview="${row.id}">预览</button><a class="button small" href="/api/invoices/${row.id}/file" download>原件下载</a><button class="subtle small danger" data-delete-invoice="${row.id}">删除</button></div></td></tr>`).join('');
+  return {html:heading('我的发票','从飞书收集，在这里整理。每一张发票，都有清晰的去处。','<button id="upload-button" class="primary">＋ 上传 PDF（可多选）</button><input type="file" id="upload-input" accept="application/pdf,.pdf" multiple hidden>')+metrics+`<section class="panel invoice-list"><div class="panel-head"><h2>发票清单</h2><span class="muted">可将多个 PDF 拖到页面上传</span></div><form class="filters" id="filters"><label>发票抬头<select name="title_id"><option value="">全部抬头</option>${options}</select></label><label>状态<select name="status"><option value="">全部状态</option>${Object.entries(labels).map(([key,value]) => `<option value="${key}" ${state.filters.status === key ? 'selected' : ''}>${value}</option>`).join('')}</select></label>${tagField(tags.items,state.filters.tag)}${invoiceSearchFields(state.filters)}<button class="primary" type="submit">筛选</button><button id="reset-filters" type="button">重置</button></form>${rows ? `<div class="table-wrap"><table><thead><tr><th>发票号码 / 类型</th><th>开票日期</th><th>发票抬头</th><th>销售方名称</th><th>价税合计</th><th>报销日期</th><th>标签</th><th>状态</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>` : empty('这里还没有发票','在飞书向机器人发送 PDF，或上传 PDF 自动识别并归类。')}${pagination(data.total,state.invoicePage,data.page_size)}</section><div class="helper">${icon('assist')}<span><strong>让飞书帮你收集。</strong> 先在「账户设置」查看绑定方式，再向机器人发送 PDF，识别结果会出现在这里。</span></div>`, bind:() => {
+    $$('[data-tag]').forEach(button => button.onclick = () => {
+      const row = data.items.find(item => item.id === Number(button.dataset.tag));
+      const selected = new Set(row.tags);
+      const choices = new Set([...selected, ...tags.items.filter(name => name !== '未分类')]);
+      openForm('修改发票标签', `<label>搜索或新建标签<input name="newTag" maxlength="64" autocomplete="off"></label>
+        <div class="tag-choices"></div><button type="button" data-add-tag hidden></button>`, '保存', async () => {
+        await api(`/api/invoices/${row.id}/tag`, {method:'PUT',body:JSON.stringify({names:[...selected]})});
+        if (data.items.length === 1 && state.invoicePage > 1 && state.filters.tag) state.invoicePage--;
+        await renderRoute();
+      });
+      const input = $('#modal [name=newTag]'), list = $('#modal .tag-choices'), add = $('#modal [data-add-tag]');
+      const refresh = () => {
+        const query = input.value.trim();
+        list.innerHTML = [...choices].filter(name => name.toLowerCase().includes(query.toLowerCase())).map(name =>
+          `<label class="check"><input type="checkbox" value="${escapeHTML(name)}" ${selected.has(name) ? 'checked' : ''}>${escapeHTML(name)}</label>`).join('');
+        add.hidden = !query || choices.has(query) || query === '未分类';
+        add.textContent = `添加「${query}」`;
+      };
+      list.onchange = event => {
+        if (event.target.checked) selected.add(event.target.value);
+        else selected.delete(event.target.value);
+      };
+      add.onclick = () => {
+        const name = input.value.trim();
+        choices.add(name); selected.add(name);
+        input.value = ''; refresh(); input.focus();
+      };
+      input.oninput = refresh;
+      input.onkeydown = event => {
+        if (event.key === 'Enter' && !event.isComposing) {
+          event.preventDefault();
+          if (!add.hidden) add.click();
+        }
+      };
+      refresh();
+      input.focus();
+    });
     $('#filters').onsubmit = event => {event.preventDefault(); state.filters = Object.fromEntries([...new FormData(event.currentTarget)].filter(([,value]) => value !== '')); state.invoicePage = 1; renderRoute();};
     $('#reset-filters').onclick = () => {state.filters = {}; state.invoicePage = 1; renderRoute();};
     $('#prev').onclick = () => {state.invoicePage--; renderRoute();}; $('#next').onclick = () => {state.invoicePage++; renderRoute();};
@@ -213,23 +271,74 @@ async function invoicePage() {
     }));
     $$('[data-edit]').forEach(button => button.onclick = () => editInvoice(data.items.find(row => row.id === Number(button.dataset.edit)), titles.items));
     $('#upload-button').onclick = () => $('#upload-input').click();
-    $('#upload-input').onchange = async event => {
-      const file = event.target.files[0]; if (!file) return;
-      if (file.size > 10*1024*1024) return toast('PDF 文件不能超过 10 MiB',true);
-      const body = new FormData(); body.append('file',file);
-      const uploadButton = $('#upload-button'); uploadButton.disabled = true; uploadButton.textContent = '上传并识别中…';
-      try {
-        const row = await api('/api/invoices/upload',{method:'POST',body});
-        toast(row.status === 'pending' ? '识别失败或信息不完整，原件已保留，请补充信息' : '发票已识别，并已归类到对应抬头');
-        state.invoicePage = 1; await renderRoute();
-        if (row.status === 'pending') {
-          const updatedTitles = await api('/api/titles');
-          editInvoice(row,updatedTitles.items);
-        }
-      } catch (error) {toast(error.message,true);}
-      finally {const button=$('#upload-button'); if(button) {button.disabled=false; button.textContent='＋ 上传 PDF';} const input=$('#upload-input'); if(input) input.value='';}
+    $('#upload-input').onchange = event => {
+      const files = [...event.target.files];
+      event.target.value = '';
+      if (files.length) uploadInvoices(files);
     };
   }};
+}
+
+function invoiceFileDrag(event) {
+  return $('#upload-input') && event.dataTransfer?.types.includes('Files');
+}
+document.addEventListener('dragover', event => {
+  if (invoiceFileDrag(event)) event.preventDefault();
+});
+document.addEventListener('drop', event => {
+  if (!invoiceFileDrag(event)) return;
+  event.preventDefault();
+  const files = Array.from(event.dataTransfer.files);
+  if (files.length && !$('#modal').open) uploadInvoices(files);
+});
+
+async function uploadInvoices(files) {
+  const modal = $('#modal');
+  modal.className = 'upload-modal';
+  modal.onclose = null;
+  // Keep the queue visible and prevent starting a second batch while it runs.
+  modal.oncancel = event => event.preventDefault();
+  modal.innerHTML = `<div class="modal-head"><h2 id="modal-title">批量上传 PDF</h2></div><div class="modal-body"><p class="muted">支持多选，每份不超过 10 MiB。识别不完整的原件会保留，可在清单中修正。</p><p data-upload-progress role="status" aria-live="polite"></p><div class="upload-results">${files.map((file,index) => `<div class="upload-result"><strong>${escapeHTML(file.name)}</strong><span class="muted" data-upload-result="${index}">等待上传</span></div>`).join('')}</div><div class="modal-footer"><button class="primary" data-upload-close disabled>上传中…</button></div></div>`;
+  const progress = $('[data-upload-progress]', modal);
+  const close = $('[data-upload-close]', modal);
+  close.onclick = () => modal.close();
+  modal.showModal();
+  let success = 0, pending = 0, failed = 0;
+  const user = state.user;
+  try {
+    for (const [index, file] of files.entries()) {
+      const result = $(`[data-upload-result="${index}"]`, modal);
+      progress.textContent = `正在处理 ${index + 1} / ${files.length}`;
+      result.textContent = '上传并识别中…';
+      try {
+        if (!state.user || state.user !== user) throw new Error('登录状态已变化，请重新登录后上传');
+        if (!/\.pdf$/i.test(file.name)) throw new Error('仅支持 PDF 文件');
+        if (file.size > 10*1024*1024) throw new Error('PDF 文件不能超过 10 MiB');
+        const body = new FormData(); body.append('file', file);
+        const row = await api('/api/invoices/upload', {method:'POST', body});
+        if (row.status === 'pending') {
+          pending++;
+          result.textContent = '待确认：原件已保留，请在清单中修正信息';
+        } else {
+          success++;
+          result.textContent = '成功：已识别并归类';
+        }
+      } catch (error) {
+        failed++;
+        result.textContent = `失败：${error.message}`;
+      }
+    }
+    progress.textContent = `处理完成，共 ${files.length} 份：成功 ${success} 份，待确认 ${pending} 份，失败 ${failed} 份。`;
+    if ((success || pending) && state.user === user) {
+      state.invoicePage = 1;
+      state.recommendation = null;
+      await renderRoute();
+    }
+  } finally {
+    modal.oncancel = null;
+    close.disabled = false;
+    close.textContent = '完成';
+  }
 }
 
 function editInvoice(row, titles) {
@@ -257,26 +366,132 @@ function editTitle(item) {
   });
 }
 
+async function matchInvoices(payload, panel) {
+  const response = await post('/api/reimbursements/optimize?stream=true', payload);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) throw new Error('匹配连接已中断，请重试');
+      buffer += decoder.decode(value, {stream:true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        const event = JSON.parse(line);
+        if (event.error) throw new Error(event.error);
+        if (event.result) return event.result;
+        $('progress', panel).max = event.total;
+        $('progress', panel).value = event.done;
+        $('.match-amount', panel).textContent = '¥ ' + money(event.best_cents / 100);
+        $('.match-work', panel).textContent = '剩余 ' + (event.total - event.done) + ' / ' + event.total + ' 张待处理';
+        $('.match-eta', panel).textContent = event.eta == null ? '正在估时' : event.eta < 1 ? '预计不足 1 秒' : '预计剩余 ' + Math.ceil(event.eta) + ' 秒';
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function reimbursementPage() {
   const titles = await api('/api/titles');
   const result = state.recommendation;
-  return {html:heading('报销助手','给一个目标金额，找到最合适的发票组合。')+`<section class="panel"><div class="panel-head"><h2>这次，准备报销多少？</h2><span class="muted">仅从所选抬头的可用发票中推荐</span></div><form id="optimize" class="section-body reimburse-form"><label>选择报销抬头<select name="title_id" required><option value="">请选择抬头</option>${titles.items.map(item=>`<option value="${item.id}" ${(result?.title_id ?? titles.items[0]?.id)===item.id?'selected':''}>${escapeHTML(item.title_name)} · ${item.active_count} 张可用</option>`).join('')}</select></label><label>目标金额（元）<input name="target_amount" type="number" min="0.01" max="999999999999.99" step="0.01" required placeholder="例如 1000.00" value="${escapeHTML(result?.target_amount || '')}"></label><button class="primary" type="submit">推荐发票组合</button><label class="check"><input name="allow_exceed" type="checkbox" ${(result?.allow_exceed ?? true)?'checked':''}>允许超过目标金额，选择最接近的组合</label></form></section><section class="panel"><div class="panel-head"><h2>推荐组合</h2><span class="muted">可取消勾选，按你的实际需要导出</span></div>${result?.invoices?.length ? `${result.message ? `<div class="helper" role="status">${escapeHTML(result.message)}</div>` : ''}<div class="table-wrap"><table><thead><tr><th>选择</th><th>发票号码</th><th>开票日期</th><th>抬头</th><th>金额</th></tr></thead><tbody>${result.invoices.map(row=>`<tr><td><input type="checkbox" data-select="${row.id}" checked aria-label="选择发票 ${escapeHTML(row.invoice_number)}"></td><td class="strong">${escapeHTML(row.invoice_number)}</td><td>${escapeHTML(row.invoice_date)}</td><td>${escapeHTML(row.buyer_name)}</td><td class="amount">¥ ${money(row.amount)}</td></tr>`).join('')}</tbody></table></div><div class="result-summary"><div><small id="selection-count"></small><strong id="selection-total"></strong><small id="selection-difference"></small></div><div class="stack"><label class="check"><input id="auto-reimburse" type="checkbox" checked>PDF 导出成功后自动标记为已报销</label><button id="generate-pdf" class="primary">生成 A4 双拼 PDF</button></div></div>` : empty(result?'暂时没有合适的组合':'把凑金额的事交给小助手',result?.message ? escapeHTML(result.message) : '选择抬头和目标金额，推荐结果会显示在这里。','assist')}</section><div class="helper">${icon('print')}<span>每张 A4 上下放置两张发票，只使用原文件第一页；奇数张时，最后一页保留一张。</span></div>`,bind:()=>{
+  let fixed = new Set(result?.fixed_invoice_ids || []);
+  return {html:heading('报销助手','给一个目标金额，找到最合适的发票组合。')+`<section class="panel"><div class="panel-head"><h2>这次，准备报销多少？</h2><span class="muted">仅从所选抬头的可用发票中推荐</span></div><form id="optimize" class="section-body reimburse-form"><label>选择报销抬头<select name="title_id" required><option value="">请选择抬头</option>${titles.items.map(item=>`<option value="${item.id}" ${(result?.title_id ?? titles.items[0]?.id)===item.id?'selected':''}>${escapeHTML(item.title_name)} · ${item.active_count} 张可用</option>`).join('')}</select></label><label>目标金额（元）<input name="target_amount" type="number" min="0.01" max="999999999999.99" step="0.01" required placeholder="例如 1000.00" value="${escapeHTML(result?.target_amount || '')}"></label><div class="actions"><button class="primary" type="submit">推荐发票组合</button><button type="button" id="pick-fixed">选择固定发票</button></div><label class="check"><input name="allow_exceed" type="checkbox" ${(result?.allow_exceed ?? true)?'checked':''}>允许超过目标金额，选择最接近的组合</label></form><div id="match-progress" hidden><div class="match-heading"><i aria-hidden="true"></i><span role="status">正在匹配发票</span></div><small>当前最佳金额</small><strong class="match-amount">计算中</strong><progress aria-label="发票匹配进度"></progress><div class="match-details"><span class="match-work">正在读取可用发票</span><span class="match-eta">正在估时</span></div></div></section><section class="panel"><div class="panel-head"><h2>推荐组合</h2><span class="muted">可取消勾选，按你的实际需要导出</span></div>${result?.invoices?.length ? `${result.message ? `<div class="helper" role="status">${escapeHTML(result.message)}</div>` : ''}<div class="table-wrap"><table><thead><tr><th>选择</th><th>发票号码</th><th>开票日期</th><th>抬头</th><th>金额</th></tr></thead><tbody>${result.invoices.map(row=>`<tr><td><input type="checkbox" data-select="${row.id}" checked ${fixed.has(row.id) ? 'disabled' : ''} aria-label="选择发票 ${escapeHTML(row.invoice_number)}"></td><td class="strong">${escapeHTML(row.invoice_number)}${fixed.has(row.id) ? '（固定）' : ''}</td><td>${escapeHTML(row.invoice_date)}</td><td>${escapeHTML(row.buyer_name)}</td><td class="amount">¥ ${money(row.amount)}</td></tr>`).join('')}</tbody></table></div><div class="result-summary"><div><small id="selection-count"></small><strong id="selection-total"></strong><small id="selection-difference"></small></div><div class="stack"><label class="check"><input id="auto-reimburse" type="checkbox" checked>PDF 导出成功后自动标记为已报销</label><label class="check"><input id="merge-pdf" type="checkbox" checked>合并导出</label><button id="generate-pdf" class="primary">生成A4双拼PDF和清单</button></div></div>` : empty(result?'暂时没有合适的组合':'把凑金额的事交给小助手',result?.message ? escapeHTML(result.message) : '选择抬头和目标金额，推荐结果会显示在这里。','assist')}</section><div class="helper">${icon('print')}<span>合并导出时，每张 A4 上下放置两张发票，只使用原文件第一页；奇数张时，最后一页保留一张。取消合并后，ZIP 内每张发票保留完整原件。</span></div>`,bind:()=>{
+    const form = $('#optimize');
+    const picker = $('#pick-fixed');
+    const title = form.elements.title_id;
+    const labelFixed = () => {
+      picker.textContent = fixed.size ? `选择固定发票（${fixed.size}）` : '选择固定发票';
+    };
+    labelFixed();
+    const hidePrevious = () => {
+      const previous = form.closest('section').nextElementSibling;
+      if (result && previous) previous.hidden = true;
+    };
+    title.onchange = () => { fixed.clear(); labelFixed(); hidePrevious(); };
+    picker.onclick = async () => {
+      if (!title.reportValidity()) return;
+      const selectedTitle = title.value;
+      picker.disabled = true;
+      try {
+        const [{items}, tags] = await Promise.all([api(`/api/reimbursements/fixed-options?title_id=${encodeURIComponent(selectedTitle)}`), api('/api/invoices/tags')]);
+        if (!form.isConnected || title.value !== selectedTitle) return;
+        const rows = items.map(row => `<tr data-fixed-row><td><input type="checkbox" name="fixed" value="${row.id}" ${fixed.has(row.id) ? 'checked' : ''} aria-label="选择发票 ${escapeHTML(row.invoice_number)}"></td><td>${escapeHTML(row.invoice_number)}</td><td>${escapeHTML(row.seller_name)}</td><td>${escapeHTML(row.invoice_date)}</td><td class="amount">¥ ${money(row.amount)}</td><td>${escapeHTML(row.remarks || '—')}</td><td>${escapeHTML(row.tags.join('、') || '未分类')}</td></tr>`).join('');
+        const content = rows ? `<div class="table-wrap"><table><thead><tr><th>选择</th><th>发票号码</th><th>销售方名称</th><th>开票日期</th><th>价税合计</th><th>备注</th><th>标签</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<p>该抬头下暂无可用发票。</p>';
+        const filters = `<div class="fixed-filters">${tagField(tags.items)}${invoiceSearchFields()}<button type="button" data-clear>重置</button></div>`;
+        openForm('选择固定发票', filters + content + '<p data-no-match hidden>没有符合筛选条件的发票。</p>', '确定', async values => {
+          const ids = values.getAll('fixed').map(Number);
+          if (ids.length > 200) throw new Error('每次最多可导出 200 张发票');
+          const chosen = new Set(ids);
+          state.recommendation = {
+            id:null, title_id:Number(selectedTitle), target_amount:form.elements.target_amount.value,
+            allow_exceed:form.elements.allow_exceed.checked, fixed_invoice_ids:ids,
+            invoices:items.filter(row => chosen.has(row.id))
+          };
+          await renderRoute();
+        });
+        const controls = $('.fixed-filters');
+        const visibleRows = $$('[data-fixed-row]', $('#modal'));
+        const filterRows = () => {
+          const value = name => controls.querySelector(`[name="${name}"]`).value.trim().toLowerCase();
+          const tag = value('tag'), seller = value('seller_name');
+          const min = value('amount_min'), max = value('amount_max');
+          const from = value('date_from'), to = value('date_to');
+          let count = 0;
+          items.forEach((row, index) => {
+            const show = (row.tags.length ? row.tags : ['未分类']).some(name => name.toLowerCase().includes(tag)) && (row.seller_name || '').toLowerCase().includes(seller)
+              && (!min || row.amount >= Number(min)) && (!max || row.amount <= Number(max))
+              && (!from || row.invoice_date >= from) && (!to || row.invoice_date <= to);
+            visibleRows[index].hidden = !show;
+            if (show) count++;
+          });
+          $('[data-no-match]').hidden = !items.length || count > 0;
+        };
+        controls.oninput = filterRows;
+        $('[data-clear]', controls).onclick = () => {
+          $$('input', controls).forEach(input => input.value = '');
+          filterRows();
+        };
+        $('#modal').classList.add('fixed-invoices');
+      } catch (error) { toast(error.message, true); }
+      finally { picker.disabled = false; }
+    };
     $('#optimize').onsubmit = async event => {
       event.preventDefault(); const form=event.currentTarget, values=new FormData(form),button=$('[type=submit]',form);button.disabled=true;
-      try {const data=await post('/api/reimbursements/optimize',{title_id:Number(values.get('title_id')),target_amount:values.get('target_amount'),allow_exceed:values.has('allow_exceed')});state.recommendation=data;await renderRoute();}
-      catch(error){toast(error.message,true);button.disabled=false;}
+      const panel = $('#match-progress');
+      panel.hidden = false;
+      $('progress',panel).removeAttribute('value');
+      $('.match-amount',panel).textContent = '计算中';
+      $('.match-work',panel).textContent = '正在读取可用发票';
+      $('.match-eta',panel).textContent = '正在估时';
+      const controls = [...form.elements];
+      controls.forEach(input => input.disabled = true);
+      try {
+        const data = await matchInvoices({title_id:Number(values.get('title_id')),target_amount:values.get('target_amount'),allow_exceed:values.has('allow_exceed'),fixed_invoice_ids:[...fixed]},panel);
+        if (form.isConnected) {state.recommendation=data; await renderRoute();}
+      } catch(error) {
+        if (form.isConnected) toast(error.message,true);
+      } finally {
+        panel.hidden = true;
+        controls.forEach(input => input.disabled = false);
+      }
     };
     if(!result?.invoices?.length)return;
     const selections=()=>$$('[data-select]:checked').map(input=>Number(input.dataset.select));
-    const update=()=>{const selected=new Set(selections()),total=result.invoices.filter(row=>selected.has(row.id)).reduce((sum,row)=>sum+Math.round(Number(row.amount)*100),0)/100;$('#selection-count').textContent=`已选择 ${selected.size} 张发票 · 目标 ¥ ${money(result.target_amount)}`;$('#selection-total').textContent='¥ '+money(total);const delta=Math.round((total-Number(result.target_amount))*100)/100;$('#selection-difference').textContent=delta===0?'刚好达到目标金额':`${delta>0?'超出':'距离'}目标 ¥ ${money(Math.abs(delta))}`;$('#generate-pdf').disabled=!selected.size;};
+    const update=()=>{const selected=new Set(selections()),total=result.invoices.filter(row=>selected.has(row.id)).reduce((sum,row)=>sum+Math.round(Number(row.amount)*100),0)/100;$('#selection-count').textContent=`已选择 ${selected.size} 张发票${result.target_amount ? ` · 目标 ¥ ${money(result.target_amount)}` : ''}`;$('#selection-total').textContent='¥ '+money(total);const delta=Math.round((total-Number(result.target_amount))*100)/100;$('#selection-difference').textContent=!result.target_amount?'':delta===0?'刚好达到目标金额':`${delta>0?'超出':'距离'}目标 ¥ ${money(Math.abs(delta))}`;$('#generate-pdf').disabled=!selected.size;};
     $$('[data-select]').forEach(input=>input.onchange=update);update();
-    $('#generate-pdf').onclick=async()=>{const button=$('#generate-pdf');button.disabled=true;try{const job=await post('/api/print/generate',{reimbursement_plan_id:result.id,invoice_ids:selections(),auto_reimburse:$('#auto-reimburse').checked});state.recommendation=null;download(job.download_url);toast(job.auto_reimburse?'PDF 已生成，所选发票已标记为已报销':'PDF 已生成，发票报销状态未变');navigate('/prints');}catch(error){toast(error.message,true);button.disabled=false;}};
+    $('#merge-pdf').onchange = event => {
+      $('#generate-pdf').textContent = event.target.checked ? '生成A4双拼PDF和清单' : '导出PDF和清单';
+    };
+    $('#generate-pdf').onclick=async()=>{const button=$('#generate-pdf');button.disabled=true;try{const job=await post('/api/print/generate',{reimbursement_plan_id:result.id,title_id:result.title_id,merge_pdf:$('#merge-pdf').checked,invoice_ids:selections(),auto_reimburse:$('#auto-reimburse').checked});state.recommendation=null;download(job.bundle_url);toast(job.auto_reimburse?'PDF 和清单已生成，所选发票已标记为已报销':'PDF 和清单已生成，发票报销状态未变');navigate('/prints');}catch(error){toast(error.message,true);button.disabled=false;}};
   }};
 }
 
 async function printPage() {
   const data=await api(`/api/print?page=${state.printPage}`);
-  const rows=data.items.map(row=>`<tr><td class="strong">A4 双拼 · #${row.id}</td><td>${escapeHTML(row.title_name)}</td><td>${row.invoice_count} 张</td><td class="amount">¥ ${money(row.total_amount)}</td><td>${row.auto_reimburse?'导出时自动报销':'未自动报销'}</td><td>${escapeHTML(dateText(row.created_at))}</td><td><a href="${row.download_url}" download>下载 PDF</a></td></tr>`).join('');
+  const rows=data.items.map(row=>`<tr><td class="strong">${row.merge_pdf ? 'A4 双拼' : '独立 PDF'} · #${row.id}</td><td>${escapeHTML(row.title_name)}</td><td>${row.invoice_count} 张</td><td class="amount">¥ ${money(row.total_amount)}</td><td>${row.auto_reimburse?'导出时自动报销':'未自动报销'}</td><td>${escapeHTML(dateText(row.created_at))}</td><td><a href="${row.download_url}" download>${row.merge_pdf ? '下载 PDF' : '下载 ZIP'}</a> ${row.manifest_url ? `<a href="${row.manifest_url}" download>下载清单</a>` : ''}</td></tr>`).join('');
   return {html:heading('打印记录','每一份整理好的发票，都可以在这里重新下载。')+`<section class="panel"><div class="panel-head"><h2>已生成的打印文件</h2><span class="muted">A4 · 上下双拼</span></div>${rows?`<div class="table-wrap"><table><thead><tr><th>文件</th><th>报销抬头</th><th>发票数量</th><th>合计金额</th><th>报销选项</th><th>生成时间</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div>`:empty('还没有打印记录','在报销助手中选择发票，即可生成 A4 双拼文件。','print')}${pagination(data.total,state.printPage,data.page_size)}</section>`,bind:()=>{$('#prev').onclick=()=>{state.printPage--;renderRoute();};$('#next').onclick=()=>{state.printPage++;renderRoute();};}};
 }
 

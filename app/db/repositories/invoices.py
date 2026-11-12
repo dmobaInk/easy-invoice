@@ -81,5 +81,11 @@ class InvoiceRepository:
                  data.buyer_name, data.seller_name, data.invoice_type,
                  float(data.amount) if data.amount is not None else None, status, str(path), message_id, failure),
             )
+            if data.remarks:
+                db.execute('INSERT INTO invoice_remarks(invoice_id, remarks) VALUES (?, ?)',
+                           (cursor.lastrowid, data.remarks))
+            if data.item_names:
+                db.execute('INSERT INTO invoice_item_names(invoice_id, names) VALUES (?, ?)',
+                           (cursor.lastrowid, ','.join(data.item_names)))
             invoice = db.execute('SELECT * FROM invoices WHERE id = ?', (cursor.lastrowid,)).fetchone()
             return SaveResult('created', Invoice(**dict(invoice)))

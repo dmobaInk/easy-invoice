@@ -23,3 +23,35 @@ dialog.feishu-qr-modal{width:min(480px,calc(100vw - 32px));max-height:90vh;max-h
 .feishu-qr-body p{line-height:1.8;margin:0 0 16px;overflow-wrap:anywhere}
 .feishu-qr-body .feishu-qr-image{display:block;width:auto;height:auto;max-width:min(100%,320px);max-height:45vh;max-height:45dvh;object-fit:contain;margin:0 auto 18px}
 .feishu-qr-body .feishu-qr-image[hidden]{display:none}
+
+.upload-results{max-height:45vh;overflow:auto}.upload-result{display:flex;flex-direction:column;gap:6px;padding:12px 0;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.upload-result span{font-size:13px}
+
+.invoice-list { container-type: inline-size; }
+.invoice-list .filters select { min-width: 0; }
+@container (min-width: 780px) {
+  .invoice-list .filters {
+    grid-template-columns: minmax(70px,1.1fr) 66px minmax(70px,1fr) minmax(75px,1.2fr) repeat(2,minmax(54px,.65fr)) repeat(2,minmax(105px,1fr)) auto auto;
+    gap: 8px;
+    padding-inline: 16px;
+  }
+  .invoice-list .filters :is(input,select,button) { padding-inline: 7px; min-width: 0; }
+  .invoice-list .filters button { white-space: nowrap; }
+}
+
+.fixed-filters {display:flex; flex-wrap:wrap; align-items:end; gap:8px; margin-bottom:14px}
+.fixed-filters label {flex:1 1 100px; min-width:0}
+.fixed-filters input {width:100%; min-width:0}
+
+@container (max-width:779px) {
+  .invoice-list .filters { grid-template-columns:90px 72px 84px 100px 68px 68px 114px 114px auto auto; overflow-x:auto; }
+  .invoice-list .filters button { white-space:nowrap; }
+}
+
+.tag-field { position:relative; min-width:0 }
+.tag-field input[name=tag] { width:100%; min-width:0; padding-right:24px }
+.tag-picker { position:absolute; right:1px; bottom:1px; height:34px; width:24px; display:grid; place-items:center; background:white; border-radius:5px }
+.tag-picker select { position:absolute; inset:0; width:100%; height:100%; min-width:0; opacity:0; cursor:pointer }
+.tag-picker:focus-within { outline:2px solid var(--ink) }
+.fixed-filters .tag-field { flex:1 1 100px }
+
+.tag-choices { display:flex; flex-wrap:wrap; gap:8px 16px; max-height:40vh; overflow:auto; margin:12px 0 }
